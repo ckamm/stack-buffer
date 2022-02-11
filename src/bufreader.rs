@@ -1,3 +1,7 @@
+#![feature(read_buf)]
+#![feature(maybe_uninit_slice)]
+#![feature(can_vector)]
+
 use std::{
     cmp, fmt, io,
     io::{BufRead, IoSliceMut, Read, ReadBuf, Seek, SeekFrom},

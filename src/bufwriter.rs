@@ -1,7 +1,6 @@
 use std::{
     fmt, io,
     io::{Error, ErrorKind, IoSlice, Seek, SeekFrom, Write},
-    mem::MaybeUninit,
     ptr,
 };
 
@@ -46,9 +45,9 @@ use std::{
 /// the `stream` is flushed.
 ///
 /// [`TcpStream`]: crate::net::TcpStream
-pub struct StackBufWriter<W: Write, const N: usize = 8192> {
+pub struct StackBufWriter<W: Write, const N: usize> {
     inner: W,
-    buf: [MaybeUninit<u8>; N],
+    buf: [u8; N],
     start: usize,
     end: usize,
     // #30888: If the inner writer panics in a call to write, we don't want to
@@ -71,7 +70,7 @@ impl<W: Write, const N: usize> StackBufWriter<W, N> {
     pub fn new(inner: W) -> StackBufWriter<W, N> {
         StackBufWriter {
             inner,
-            buf: unsafe { MaybeUninit::uninit().assume_init() },
+            buf: [0u8; N],
             start: 0,
             end: 0,
             panicked: false,
@@ -135,7 +134,7 @@ impl<W: Write, const N: usize> StackBufWriter<W, N> {
         }
 
         let mut guard = BufGuard::new(
-            unsafe { MaybeUninit::slice_assume_init_ref(&self.buf[self.start..self.end]) },
+            &self.buf[self.start..self.end],
             &mut self.start,
             &mut self.end,
         );
@@ -209,7 +208,7 @@ impl<W: Write, const N: usize> StackBufWriter<W, N> {
     /// let bytes_buffered = buf_writer.buffer().len();
     /// ```
     pub fn buffer(&self) -> &[u8] {
-        unsafe { MaybeUninit::slice_assume_init_ref(&self.buf[self.start..self.end]) }
+        &self.buf[self.start..self.end]
     }
 
     /// Returns the number of bytes the internal buffer can hold without flushing.
@@ -317,7 +316,7 @@ impl<W: Write, const N: usize> StackBufWriter<W, N> {
         debug_assert!(buf.len() <= self.spare_capacity());
         let buf_len = buf.len();
         let src = buf.as_ptr();
-        let dst = MaybeUninit::slice_assume_init_mut(&mut self.buf)
+        let dst = (&mut self.buf)
             .as_mut_ptr()
             .add(self.end);
         ptr::copy_nonoverlapping(src, dst, buf_len);
@@ -350,92 +349,42 @@ impl<W: Write, const N: usize> Write for StackBufWriter<W, N> {
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         // FIXME: Consider applying `#[inline]` / `#[inline(never)]` optimizations already applied
         // to `write` and `write_all`. The performance benefits can be significant. See #79930.
-        if self.get_ref().is_write_vectored() {
-            // We have to handle the possibility that the total length of the buffers overflows
-            // `usize` (even though this can only happen if multiple `IoSlice`s reference the
-            // same underlying buffer, as otherwise the buffers wouldn't fit in memory). If the
-            // computation overflows, then surely the input cannot fit in our buffer, so we forward
-            // to the inner writer's `write_vectored` method to let it handle it appropriately.
-            let saturated_total_len = bufs
-                .iter()
-                .fold(0usize, |acc, b| acc.saturating_add(b.len()));
 
-            if saturated_total_len > self.spare_capacity() {
-                // Flush if the total length of the input exceeds our buffer's spare capacity.
-                // If we would have overflowed, this condition also holds, and we need to flush.
-                self.flush_buf()?;
-            }
+        // We have to handle the possibility that the total length of the buffers overflows
+        // `usize` (even though this can only happen if multiple `IoSlice`s reference the
+        // same underlying buffer, as otherwise the buffers wouldn't fit in memory). If the
+        // computation overflows, then surely the input cannot fit in our buffer, so we forward
+        // to the inner writer's `write_vectored` method to let it handle it appropriately.
+        let saturated_total_len = bufs
+            .iter()
+            .fold(0usize, |acc, b| acc.saturating_add(b.len()));
 
-            if saturated_total_len >= self.buf.len() {
-                // Forward to our inner writer if the total length of the input is greater than or
-                // equal to our buffer capacity. If we would have overflowed, this condition also
-                // holds, and we punt to the inner writer.
-                self.panicked = true;
-                let r = self.get_mut().write_vectored(bufs);
-                self.panicked = false;
-                r
-            } else {
-                // `saturated_total_len < self.buf.capacity()` implies that we did not saturate.
-
-                // SAFETY: We checked whether or not the spare capacity was large enough above. If
-                // it was, then we're safe already. If it wasn't, we flushed, making sufficient
-                // room for any input <= the buffer size, which includes this input.
-                unsafe {
-                    bufs.iter().for_each(|b| self.write_to_buffer_unchecked(b));
-                };
-
-                Ok(saturated_total_len)
-            }
-        } else {
-            let mut iter = bufs.iter();
-            let mut total_written = if let Some(buf) = iter.by_ref().find(|&buf| !buf.is_empty()) {
-                // This is the first non-empty slice to write, so if it does
-                // not fit in the buffer, we still get to flush and proceed.
-                if buf.len() > self.spare_capacity() {
-                    self.flush_buf()?;
-                }
-                if buf.len() >= self.buf.len() {
-                    // The slice is at least as large as the buffering capacity,
-                    // so it's better to write it directly, bypassing the buffer.
-                    self.panicked = true;
-                    let r = self.get_mut().write(buf);
-                    self.panicked = false;
-                    return r;
-                } else {
-                    // SAFETY: We checked whether or not the spare capacity was large enough above.
-                    // If it was, then we're safe already. If it wasn't, we flushed, making
-                    // sufficient room for any input <= the buffer size, which includes this input.
-                    unsafe {
-                        self.write_to_buffer_unchecked(buf);
-                    }
-
-                    buf.len()
-                }
-            } else {
-                return Ok(0);
-            };
-            debug_assert!(total_written != 0);
-            for buf in iter {
-                if buf.len() <= self.spare_capacity() {
-                    // SAFETY: safe by above conditional.
-                    unsafe {
-                        self.write_to_buffer_unchecked(buf);
-                    }
-
-                    // This cannot overflow `usize`. If we are here, we've written all of the bytes
-                    // so far to our buffer, and we've ensured that we never exceed the buffer's
-                    // capacity. Therefore, `total_written` <= `self.buf.capacity()` <= `usize::MAX`.
-                    total_written += buf.len();
-                } else {
-                    break;
-                }
-            }
-            Ok(total_written)
+        if saturated_total_len > self.spare_capacity() {
+            // Flush if the total length of the input exceeds our buffer's spare capacity.
+            // If we would have overflowed, this condition also holds, and we need to flush.
+            self.flush_buf()?;
         }
-    }
 
-    fn is_write_vectored(&self) -> bool {
-        true
+        if saturated_total_len >= self.buf.len() {
+            // Forward to our inner writer if the total length of the input is greater than or
+            // equal to our buffer capacity. If we would have overflowed, this condition also
+            // holds, and we punt to the inner writer.
+            self.panicked = true;
+            let r = self.get_mut().write_vectored(bufs);
+            self.panicked = false;
+            r
+        } else {
+            // `saturated_total_len < self.buf.capacity()` implies that we did not saturate.
+
+            // SAFETY: We checked whether or not the spare capacity was large enough above. If
+            // it was, then we're safe already. If it wasn't, we flushed, making sufficient
+            // room for any input <= the buffer size, which includes this input.
+            unsafe {
+                bufs.iter().for_each(|b| self.write_to_buffer_unchecked(b));
+            };
+
+            Ok(saturated_total_len)
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {

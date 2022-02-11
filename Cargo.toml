@@ -9,6 +9,11 @@ keywords = ["buf", "buffer", "stack"]
 categories = ["caching", "data-structures", "memory-management"]
 license = "Apache-2.0"
 
+[features]
+reader = []
+writer = []
+default = ["reader", "writer"]
+
 [dev-dependencies]
 criterion = "0.3.5"
 rand = "0.8.4"
